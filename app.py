@@ -2,9 +2,9 @@ import streamlit as st
 import numpy as np
 import cv2
 import joblib
-import matplotlib.pyplot as plt
 
 from PIL import Image
+from sklearn.neighbors import NearestNeighbors
 from skimage.feature import graycomatrix, graycoprops, local_binary_pattern
 
 st.set_page_config(
@@ -15,17 +15,32 @@ st.set_page_config(
 
 CLASS_NAMES = ["Car", "Ship"]
 
+# Seuil de confiance minimal (KNN k=5 : 0.6 = 3 voisins sur 5)
+MIN_CONFIDENCE = 0.60
+
+
 @st.cache_resource
 def load_artifacts():
     model = joblib.load("model.pkl")
     scaler = joblib.load("scaler.pkl")
+
     model_name = "Meilleur modèle"
     try:
         with open("model_name.txt", "r", encoding="utf-8") as f:
             model_name = f.read().strip()
     except FileNotFoundError:
         pass
-    return model, scaler, model_name
+
+    # Détection d'images « hors sujet » (facultatif mais recommandé)
+    ood = None
+    try:
+        data = joblib.load("ood.pkl")
+        nn = NearestNeighbors(n_neighbors=data["k"]).fit(data["X_ref"])
+        ood = {"nn": nn, "threshold": float(data["threshold"])}
+    except FileNotFoundError:
+        pass
+
+    return model, scaler, model_name, ood
 
 
 def color_Moments(img):
@@ -145,11 +160,12 @@ st.title("🚗🚢 Classification d'images")
 st.subheader("Car vs Ship")
 st.write(
     "Importez une image et le modèle entraîné dans votre TP "
-    "prédira automatiquement sa classe."
+    "prédira automatiquement sa classe. "
+    "Si l'image n'est ni une voiture ni un bateau, le résultat sera **Inconnu**."
 )
 
 try:
-    model, scaler, model_name = load_artifacts()
+    model, scaler, model_name, ood = load_artifacts()
 except Exception as e:
     st.error("Les fichiers model.pkl et scaler.pkl sont nécessaires.")
     st.code(str(e))
@@ -177,28 +193,50 @@ if uploaded_file is not None:
         prediction = int(model.predict(features_scaled)[0])
         predicted_class = CLASS_NAMES[prediction]
 
+        # Confiance du modèle
+        probabilities = None
+        confidence = None
+        if hasattr(model, "predict_proba"):
+            probabilities = model.predict_proba(features_scaled)[0]
+            confidence = float(np.max(probabilities))
+
+        # Distance de l'image aux images d'apprentissage
+        ood_score = None
+        is_far = False
+        if ood is not None:
+            dist, _ = ood["nn"].kneighbors(features_scaled)
+            ood_score = float(dist.mean())
+            is_far = ood_score > ood["threshold"]
+
+        # Décision finale
+        is_unknown = is_far or (
+            confidence is not None and confidence < MIN_CONFIDENCE
+        )
+
     st.divider()
     st.subheader("🔎 Résultat")
 
-    if predicted_class == "Car":
+    if is_unknown:
+        st.warning("❓ Classe prédite : INCONNU (ni Car, ni Ship)")
+    elif predicted_class == "Car":
         st.success("🚗 Classe prédite : CAR")
     else:
         st.info("🚢 Classe prédite : SHIP")
 
     st.write(f"**Modèle utilisé :** {model_name}")
 
-    # Probabilité si le modèle la fournit
-    if hasattr(model, "predict_proba"):
-        probabilities = model.predict_proba(features_scaled)[0]
-        confidence = float(np.max(probabilities)) * 100
-
-        st.metric(
-            "Confiance de la prédiction",
-            f"{confidence:.2f} %"
-        )
+    if confidence is not None:
+        st.metric("Confiance de la prédiction", f"{confidence * 100:.2f} %")
 
         st.write("Probabilités :")
         for i, name in enumerate(CLASS_NAMES):
             st.write(f"- {name} : {probabilities[i] * 100:.2f} %")
+
+    if ood_score is not None:
+        with st.expander("Détails de la détection « Inconnu »"):
+            st.write(f"Distance aux images d'apprentissage : {ood_score:.3f}")
+            st.write(f"Seuil maximal accepté : {ood['threshold']:.3f}")
+            if is_far:
+                st.write("➡️ L'image est trop différente des voitures et bateaux connus.")
 else:
     st.info("👆 Importez une image pour commencer.")
